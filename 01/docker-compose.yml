@@ -1,0 +1,54 @@
+name: ml_jupyter
+
+services:
+  # [1] 지휘관이자 마스터 역할 (주피터 노트북)
+  jupyter:
+    image: jupyter/all-spark-notebook:latest
+    container_name: jupyter-ml
+    mem_limit: 4g
+    user: root
+    ports:
+      - "9999:8888"   # 주피터 노트북 웹 UI
+      - "4040:4040"   # 스파크 작업 모니터링 UI (중요!)
+      - "8080:8080"   # 스파크 마스터 관리자 UI
+    environment:
+      - SPARK_MASTER_HOST=jupyter
+    volumes:
+      - ./실습코드:/home/jovyan/work
+      - ./requirements.txt:/tmp/requirements.txt
+    command: >
+      bash -c "pip install --no-cache-dir -r /tmp/requirements.txt &&
+               pip uninstall -y bottleneck numexpr pyarrow &&
+               /usr/local/spark/sbin/start-master.sh &&
+               start-notebook.sh --IdentityProvider.token=''"
+    restart: unless-stopped
+
+  # [2] 첫 번째 진짜 일꾼 컨테이너
+  spark-worker-1:
+    image: jupyter/all-spark-notebook:latest
+    container_name: spark-worker-1
+    mem_limit: 2g   # 일꾼 1호의 메모리 제한
+    user: root
+    depends_on:
+      - jupyter
+    # ★ 추가: 워커 1호도 주피터와 똑같은 폴더를 바라보게 만듭니다.
+    volumes:
+      - ./실습코드:/home/jovyan/work
+    command: >
+      bash -c "/usr/local/spark/sbin/start-worker.sh spark://jupyter:7077 && tail -f /dev/null"
+    restart: unless-stopped
+
+  # [3] 두 번째 진짜 일꾼 컨테이너
+  spark-worker-2:
+    image: jupyter/all-spark-notebook:latest
+    container_name: spark-worker-2
+    mem_limit: 2g   # 일꾼 2호의 메모리 제한
+    user: root
+    depends_on:
+      - jupyter
+    # ★ 추가: 워커 2호도 주피터와 똑같은 폴더를 바라보게 만듭니다.
+    volumes:
+      - ./실습코드:/home/jovyan/work
+    command: >
+      bash -c "/usr/local/spark/sbin/start-worker.sh spark://jupyter:7077 && tail -f /dev/null"
+    restart: unless-stopped

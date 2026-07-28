@@ -1,0 +1,17 @@
+# 코어 수치 스택 — 반드시 버전 고정 (numpy ABI 충돌 방지)
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.16.3
+matplotlib==3.10.0
+scikit-learn==1.6.1
+statsmodels==0.14.6
+# 머신러닝(앙상블·부스팅·불균형)
+xgboost
+lightgbm
+imbalanced-learn
+# 시각화 / 연관규칙 / 저장
+seaborn
+mlxtend
+joblib
+# 데이터 오염도 여부 측정
+ydata-profiling
