@@ -1,0 +1,20 @@
+name: ml_jupyter
+
+services:
+  jupyter:
+    # 1. 스파크와 자바가 내장된 공식 이미지로 변경
+    image: jupyter/all-spark-notebook:latest
+    container_name: jupyter-ml
+    mem_limit: 4g
+    user: root  # (선택) 패키지 언인스톨 권한 오류 방지
+    ports:
+      - "9999:8888"
+    volumes:
+      # 실습코드 폴더 전체를 Jupyter 작업 폴더로 마운트
+      - ./실습코드:/home/jovyan/work
+      - ./requirements.txt:/tmp/requirements.txt
+    command: >
+      bash -c "pip install --no-cache-dir -r /tmp/requirements.txt &&
+               pip uninstall -y bottleneck numexpr pyarrow &&
+               start-notebook.sh --IdentityProvider.token=''"
+    restart: unless-stopped
