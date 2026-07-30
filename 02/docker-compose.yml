@@ -1,0 +1,57 @@
+name: spark_on_kubernetes_cluster
+
+services:
+  # ① 로컬 가상 쿠버네티스 클러스터 (K3s - 경량 쿠버네티스 엔진)
+  k8s-cluster:
+    image: rancher/k3s:v1.27.4-k3s1
+    container_name: k8s-master-node
+    command: server --disable traefik
+    privileged: true
+    ports:
+      - "6443:6443"  # K8s API 서버 포트 (Jupyter가 일꾼 요청을 보낼 주소)
+    volumes:
+      - k8s-config:/etc/rancher/k3s
+    restart: unless-stopped
+
+  # ② 작업 제출기 (Jupyter - 쿠버네티스에 작업을 요청하는 클라이언트)
+  # ★ 이제 워커 컨테이너(Worker-1, 2)를 미리 정의하지 않습니다. K8s가 알아서 동적으로 만들 것이기 때문입니다.
+  jupyter-client:
+    image: jupyter/base-notebook:latest
+    container_name: k8s-spark-jupyter
+    mem_limit: 2g
+    user: root # 자바 설치 및 패키지 업데이트를 위해 root 권한 유지
+    ports:
+      - "9999:8888"
+    volumes:
+      - ./실습코드:/home/jovyan/work
+      - k8s-config:/etc/rancher/k3s:ro # K8s 인증 설정을 공유받음
+    environment:
+      - KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+      # ★ 추가: 설치될 자바(Java)의 절대 경로를 환경 변수로 지정합니다.
+      - JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+    command: >
+      bash -c "apt-get update && 
+               apt-get install -y openjdk-17-jdk-headless && 
+               pip install pyspark==3.4.1 &&
+               start-notebook.sh --IdentityProvider.token=''"
+    restart: unless-stopped
+    depends_on:
+      - k8s-cluster
+  
+  # ③ 중앙 분산 저장소 (MinIO - 공유 볼륨 없이 네트워크로만 데이터 제공)
+  minio-storage:
+    image: minio/minio:latest
+    container_name: k8s-s3-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - ./minio_data:/data
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+
+volumes:
+  k8s-config:
