@@ -16,7 +16,7 @@ hadoop_conf.set("fs.s3a.secret.key","minioadmin")
 hadoop_conf.set("fs.s3a.path.style.access","true")
 hadoop_conf.set("fs.s3a.impl","org.apache.hadoop.fs.s3a.S3AFileSystem")
 
-df = spark.read.parquet("s3a://test-bucket/bronze/cluster_mode_result")
+df = spark.read.csv("s3a://test-bucket/2019-Nov.csv",header=True, inferSchema=True)
 pid_code_map = df.filter(sf.col('category_code').isNotNull()) \
     .select('product_id', 'category_code') \
     .dropDuplicates(['product_id']) \
@@ -48,7 +48,7 @@ refined_df = df_join.filter(df_join['category_code'].isNotNull() & df_join['bran
 refined_df = refined_df.drop('product_id','category_id','user_id','user_session')
 refined_df = refined_df.withColumn("event_date", sf.to_date(sf.col("event_time")))
 
-refined_df.repartition('category_code').write.mode('Overwrite').partitionBy('category_code').parquet("s3a://test-bucket/silver/ecommerce_refined")
+refined_df.write.mode('Overwrite').partitionBy('category_code').parquet("s3a://test-bucket/silver/ecommerce_refined")
 
 
 # In[ ]:
