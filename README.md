@@ -8,8 +8,9 @@ PySpark 학습용 실습 저장소. Docker 기반 Jupyter + Spark 환경에서 R
 | --- | --- | --- |
 | [`00/`](00) | 싱글 노드 | Jupyter 한 컨테이너에서 Spark를 로컬(`local`) 모드로 실행. RDD/DataFrame 기본기 실습 |
 | [`01/`](01) | 멀티 노드 클러스터 | Jupyter(마스터) + Spark 워커 2대로 구성된 클러스터. 실제 클러스터 연결·분산 처리 실습 |
+| [`02/`](02) | Kubernetes(k3s) 클러스터 모드 | k3s + MinIO(S3 호환) + Jupyter. `spark-submit --deploy-mode cluster`로 k8s 팟을 동적 생성해 처리하는 실무형 파이프라인(Bronze/Silver/Gold) 실습 |
 
-두 폴더 모두 동일한 구조(`docker-compose.yml`, `requirements.txt`, `실습코드/`)를 가지며, 각자 독립적으로 `docker compose up`으로 띄울 수 있습니다.
+`00`, `01`은 동일한 구조(`docker-compose.yml`, `requirements.txt`, `실습코드/`)를 가지며, 각자 독립적으로 `docker compose up`으로 띄울 수 있습니다. `02`는 별도로 MinIO와 k3s가 추가된 구조입니다(아래 참고).
 
 ### 00 — 싱글 노드 (`00/docker-compose.yml`)
 
@@ -39,6 +40,36 @@ docker compose up
 # http://localhost:4040 : Spark Job UI
 ```
 
+### 02 — Kubernetes(k3s) 클러스터 모드 (`02/docker-compose.yml`)
+
+로컬 `docker-compose`로 "가짜 프로덕션" 환경(k8s 클러스터 + S3 호환 오브젝트 스토리지)을 흉내내서, 실무의 spark-submit 배포 방식을 그대로 연습하는 구성.
+
+- 컨테이너 3개
+  - `k8s-master-node` (`rancher/k3s`): 로컬 가상 쿠버네티스 클러스터. Jupyter가 여기로 작업을 제출하면 driver/executor 팟을 동적으로 생성함
+  - `k8s-spark-jupyter` (`jupyter/base-notebook` + PySpark 3.4.1 자동 설치): 코드 작성/로컬(`local[*]`) 검증용 클라이언트
+  - `k8s-s3-minio`: S3 호환 오브젝트 스토리지. 원본 데이터/코드/결과물을 모두 여기(`test-bucket`, `code-bucket`)에 저장
+- 포트: `9999→8888`(Jupyter), `6443`(k8s API), `9000`/`9001`(MinIO API/콘솔)
+- MinIO는 `./minio_data` 볼륨 마운트라 컨테이너 재생성에도 데이터가 살아남음. **k3s(`k8s-master-node`)는 상태가 볼륨에 안 남아서, Docker Desktop이 재시작되면 RBAC/배포된 서비스가 전부 초기화됨** (복구 절차는 `02/start.md` 13번 참고)
+
+```bash
+cd 02
+docker compose up
+# http://localhost:9999 : Jupyter (로컬 검증용)
+# http://localhost:9001 : MinIO 콘솔 (minioadmin/minioadmin)
+```
+
+**아키텍처 — Bronze / Silver / Gold 메달리온**
+
+| 레이어 | 경로 | 내용 |
+| --- | --- | --- |
+| Bronze | `s3a://test-bucket/bronze/cluster_mode_result` | 원본 CSV(8.4GiB)를 Parquet으로 1회 변환 (2.3GiB) |
+| Silver | `s3a://test-bucket/silver/ecommerce_refined` | product_id/category_id 기준 self-join으로 category_code·brand 결측치 보강 + 정제 |
+| Gold | `s3a://test-bucket/gold/*` | 이벤트 퍼널, 카테고리/브랜드별 매출, 일별 추이, 가격 기술통계 등 집계 테이블 8종 |
+
+**실행 방식 2가지**
+- **로컬 검증** (`*.ipynb`, `master("local[*]")`): 코드 개발/디버깅, 샘플 데이터로 로직 검증, 이미 계산 끝난 Gold 테이블 눈으로 확인할 때
+- **클러스터 제출** (`*.py`, `spark-submit --deploy-mode cluster`): MinIO의 `code-bucket`에 업로드 후 `kubectl run`으로 제출, 실제 대용량 데이터 처리 및 최종 검증
+
 ## 공통 의존성 (`requirements.txt`)
 
 컨테이너 기동 시 자동 설치됩니다 (numpy ABI 충돌 방지를 위해 핵심 수치 스택은 버전 고정).
@@ -49,7 +80,8 @@ docker compose up
 
 ## 실습 데이터
 
-`행정안전부_착한가격업소 현황_20260630.csv` — 행정안전부의 "착한가격업소" 현황 데이터(시도/시군/업종/업소명/연락처/주소/메뉴·가격 등 12,645행). 00, 01 양쪽 실습코드 폴더에 각각 위치.
+- `행정안전부_착한가격업소 현황_20260630.csv` — 행정안전부의 "착한가격업소" 현황 데이터(시도/시군/업종/업소명/연락처/주소/메뉴·가격 등 12,645행). 00, 01 양쪽 실습코드 폴더에 각각 위치.
+- `2019-Nov.csv` — 이커머스 이벤트 로그(event_time/event_type/product_id/category_id/category_code/brand/price/user_id/user_session, 8.4GiB). `02`에서 MinIO(`test-bucket`)에 올려두고 Bronze/Silver/Gold 파이프라인 실습에 사용.
 
 ## 노트북 실습 내용
 
@@ -64,6 +96,22 @@ docker compose up
 ### `01/실습코드/01/`
 
 - **`01.ipynb`** — `spark://jupyter:7077` 클러스터 마스터에 연결하여 워커 분산 처리 실습. 착한가격업소 CSV 로드(스키마/행 수/미리보기 확인) → `inferSchema` 끄고 `repartition(4)`로 파티션 강제 분할 → 가격 컬럼 정수 변환 후 `rollup("업종", "시도")`로 업종별·업종+시도별 평균 가격 집계
+
+### `02/실습코드/01/` — Kubernetes 클러스터 모드, Bronze/Silver/Gold 파이프라인
+
+이커머스 이벤트 로그(`2019-Nov.csv`, Kaggle "eCommerce behavior data" 계열, product_id/event_type/category_code/brand/price 등)를 대상으로 실무형 배치 파이프라인을 구성. `.py`는 `spark-submit --deploy-mode cluster`로 k3s에 제출하는 실행 파일, `.ipynb`는 로컬(`local[*]`) 개발·검증용.
+
+| 파일 | 역할 |
+| --- | --- |
+| `start.py` | **Bronze**: 원본 CSV(8.4GiB) → Parquet(2.3GiB) 1회 변환. 이후 모든 job이 CSV 대신 이걸 읽어서 파싱/스키마추론 비용을 줄임 |
+| `01.py` / `01.ipynb` | k3s 클러스터 모드 첫 실습 — S3A(MinIO) 연동 설정, `category_code`별 count 집계 후 저장. spark-submit 배포 시행착오(RBAC, driver 이미지 지정, DNS resolve 문제 등)의 대상 코드 |
+| `01View.ipynb` | 로컬 세션에서 `01.py`가 저장한 결과를 다시 읽어 확인하는 검증용 노트북 |
+| `02.py` / `02.ipynb` | **Silver**: Bronze parquet을 읽어 product_id/category_id 기준 self-join으로 `category_code`/`brand` 결측치 보강 → 정제된 데이터를 `category_code`로 파티셔닝해 저장. `.repartition('category_code')`로 파일 개수·커밋 시간 최적화 |
+| `03.py` / `03.ipynb` | **Gold**: Silver를 읽어 이벤트 퍼널, 카테고리/브랜드별 매출 Top N, 일별 추이, 가격 기술통계 등 8개 집계 테이블을 생성해 저장 |
+| `03View.ipynb` | `02.ipynb`/`03.ipynb` 개발 과정에서 로컬 세션으로 중간 결과를 확인한 노트북 |
+| `resultView.ipynb` | Gold 레이어 결과만 로컬(`local[*]`)로 읽어서 눈으로 확인하는 노트북 (Gold는 이미 계산 끝난 작은 집계 결과라 로컬로 읽어도 빠름) |
+
+파이프라인 전체의 시행착오 히스토리(spark-submit 튜닝, S3A 자격증명, 모니터링 UI 설정, self-join row 폭발 디버깅, 로컬 리소스 부족으로 인한 크래시와 최적화, Docker Desktop 재시작 후 클러스터 복구 절차 등)는 **[`02/start.md`](02/start.md)** 에 상세히 기록되어 있습니다.
 
 ## 요구 사항
 

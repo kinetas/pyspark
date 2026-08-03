@@ -642,3 +642,185 @@ Cannot use the keyword 'proxy' or 'history' in reverse proxy URL.
 - 스크립트를 중복 실행하면 안 됨 (포트 4040 충돌 에러 발생). `ps aux | grep watch-4040` 또는 `netstat -ano | grep 4040`으로 기존 프로세스 확인 후 실행할 것.
 - 다시 설정해야 하는 경우는 History Server(8-2)와 동일한 기준: Windows 재부팅/터미널 종료 → 2번(nohup 재실행)만 다시. `docker compose down/up`으로 노드 재생성 → Service부터 다시 생성. `docker restart` → 자동 복구, port-forward만 재실행.
 - 지금 이 두 가지(History Server 18080 + 실시간 4040)를 합치면: **평소엔 18080으로 지난 기록 확인, 뭔가 지금 도는지 궁금할 때는 4040으로 실시간 확인**, 둘 다 재설정 없이 상시 접근 가능.
+
+---
+
+## 2026-07-31 작업 정리
+
+## 10. `02.py`(실버 정제) 로직 디버깅
+
+로컬(`local[*]`) 샘플 데이터로 검증하다가 발견된 문제들.
+
+### 10-1. 실행 자체를 막는 오타/문법 버그
+
+- `import pyspark.sql.funtions as sf` → `functions` 오타 (`ModuleNotFoundError`)
+- `join_condition = (df['product_id'] == mapping_df['pid'] | df['category_id'] == mapping_df['cid'])` → 괄호 누락. Python은 `==`가 `|`보다 우선순위 높아서 의도한 OR 조건이 아니라 체인 비교로 파싱됨. `(a == b) | (c == d)`로 괄호 필수.
+- `df.join(..., on=join_condtion, ...)` → 변수명 오타(`join_condtion` vs `join_condition`)
+- `df.fillter(...)` → `filter` 오타
+- `to_date(col("event_time"))` → `to_date`/`col` import 안 함, `sf.to_date(sf.col(...))`로 수정
+- `.withColumn(sf.col('category_code'), ...)` → `withColumn(colName: str, col: Column)`의 1번째 인자는 문자열이어야 하는데 `Column` 객체를 넣어서 `TypeError: Column is not iterable` 발생. `withColumn('category_code', ...)`로 수정.
+
+### 10-2. self-join 결측치 채우기 로직의 row 폭발 버그
+
+**증상**: 샘플 10만 행을 join했더니 결과가 26,267,352행으로 폭증.
+
+**원인**: `mapping_df`를 만들 때 `.distinct()`가 `(product_id, category_id, category_code)` **조합 전체** 기준으로 중복 제거됨. 그런데 category_id 하나에는 서로 다른 product_id가 수백 개 딸려있어서, category_id 기준으로는 전혀 1:1이 아님. 이 상태에서 `(product_id==pid) | (category_id==cid)`로 OR 조인하면, df의 한 행이 같은 category_id를 가진 mapping_df 행 전부와 매칭되어 row가 폭발함(self-join 다대다 매칭).
+
+**해결**: 조회표를 "키 하나당 값 하나"로 만들고(`dropDuplicates(['product_id'])`, `dropDuplicates(['category_id'])`), OR 조건 하나로 합쳐서 조인하지 않고 **키 컬럼 기준으로 순차 조인**:
+
+```python
+pid_code_map = df.filter(sf.col('category_code').isNotNull()) \
+    .select('product_id', 'category_code') \
+    .dropDuplicates(['product_id']) \
+    .withColumnRenamed('category_code', 'code_by_pid')
+
+pid_brand_map = df.filter(sf.col('brand').isNotNull()) \
+    .select('product_id', 'brand') \
+    .dropDuplicates(['product_id']) \
+    .withColumnRenamed('brand', 'brand_by_pid')
+
+cid_map = df.filter(sf.col('category_code').isNotNull()) \
+    .select('category_id', 'category_code') \
+    .dropDuplicates(['category_id']) \
+    .withColumnRenamed('category_code', 'code_by_cid')
+
+df_join = df.join(sf.broadcast(pid_code_map), on='product_id', how='left') \
+    .join(sf.broadcast(pid_brand_map), on='product_id', how='left') \
+    .join(sf.broadcast(cid_map), on='category_id', how='left')
+
+df_join = df_join.withColumn('category_code', sf.coalesce(sf.col('category_code'), sf.col('code_by_cid'), sf.col('code_by_pid'))) \
+    .withColumn('brand', sf.coalesce(sf.col('brand'), sf.col('brand_by_pid'))) \
+    .drop('code_by_cid', 'code_by_pid', 'brand_by_pid')
+```
+
+주의: `category_code`/`brand`를 하나의 AND 필터(`category_code.isNotNull() & brand.isNotNull()`)로 묶어서 조회표를 만들면 안 됨 — 어떤 행은 category_code만 있고 brand는 없을 수 있는데, AND로 묶으면 그 행 전체가 버려져서 살릴 수 있었던 정보까지 날아감. 컬럼별로 독립적인 조회표를 따로 만들어야 함.
+
+### 10-3. 결측치 채우기 자체가 이 데이터에서는 효과가 없다는 결론
+
+self-join 수정 후 검증: `df_join`에서 category_code/brand가 둘 다 채워진 행 개수(59,442)가 **원본 `df`에서 애초에 둘 다 있던 행 개수(59,442)와 정확히 동일** — 즉 join으로 새로 채워진 행이 0개.
+
+**원인**: 이 데이터(2019-Nov.csv, 이커머스 이벤트 로그)는 category_code/brand 결측이 row 단위로 랜덤한 게 아니라 **product_id 단위로 "카탈로그에 등록 안 된 상품은 모든 row가 항상 null"**인 구조. 그래서 self-join으로 빌려올 "다른 행"이 애초에 존재하지 않음. 검증 쿼리:
+
+```python
+check = df.groupBy('product_id').agg(
+    sf.sum(sf.when(sf.col('category_code').isNotNull(), 1).otherwise(0)).alias('has_code'),
+    sf.sum(sf.when(sf.col('category_code').isNull(), 1).otherwise(0)).alias('no_code')
+)
+check.filter((sf.col('has_code') > 0) & (sf.col('no_code') > 0)).count()  # 0에 가까우면 가설 확정
+```
+
+→ 결측 상품은 자체 데이터로는 못 채우고, 드롭하거나 외부 카탈로그를 붙여야 함.
+
+---
+
+## 11. 로컬 리소스 한계: Docker Desktop 크래시와 최적화
+
+### 11-1. 크래시 원인
+
+전체 원본(`2019-Nov.csv`, 8.4GiB)을 `spark.executor.instances`/메모리 제한 없이 executor 4개로 클러스터 모드 제출했다가 **Docker Desktop 자체가 응답 불능 상태**가 됨.
+
+`docker info`로 확인한 원인: Docker Desktop VM에 할당된 리소스가 **12코어 / 약 8.24GB 메모리**뿐인데, 이걸 `k8s-spark-jupyter` + `k8s-s3-minio` + `k8s-master-node`(그 안의 driver+executor 4개+시스템 팟 전부)가 나눠 써야 함. 원본 파일 크기(8.4GiB)만으로 이미 전체 가용 메모리와 맞먹어서, JVM 오버헤드/셔플 스필 추가하면 터지는 게 당연한 상황이었음.
+
+### 11-2. 적용한 최적화
+
+1. **Bronze 레이어 도입 (CSV → Parquet 사전 변환)**: `start.py`로 원본 CSV를 한 번 읽어서 `s3a://test-bucket/bronze/cluster_mode_result`에 parquet으로 저장 (8.4GiB → 2.3GiB). 이후 `02.py`는 CSV 대신 이 bronze parquet을 읽도록 수정. CSV는 매번 전체 파싱 + `inferSchema=True`가 타입 추론을 위해 파일을 미리 훑어야 해서 느림; parquet은 컬럼형+압축+스캔 불필요.
+2. **executor 리소스 명시적 제한**: 이후 모든 spark-submit에 아래 conf 추가 (8GB 예산 안에서 확실히 도는 크기로 제한).
+   ```
+   --conf spark.driver.memory=1g
+   --conf spark.executor.memory=1g
+   --conf spark.executor.memoryOverhead=512m
+   --conf spark.dynamicAllocation.maxExecutors=2
+   ```
+   이 설정으로 bronze 변환(27분) → silver 정제까지 크래시 없이 완주함.
+
+### 11-3. `repartition('category_code')`로 커밋 단계 최적화
+
+`partitionBy('category_code')`로 쓸 때, 원래 파티션 개수(24개)만큼 카테고리 폴더마다 파일이 여러 개 생겨서(최대 24개) 총 3014개 오브젝트가 생성됐고, `FileOutputCommitter`(algorithm v1)가 **driver 혼자 파일을 하나씩 순차적으로 커밋**(S3A에서는 rename이 copy+delete라 더 느림)하느라 연산 자체(4분30초)보다 커밋(14분)이 더 오래 걸림.
+
+`write()` 직전에 `.repartition('category_code')` 추가 → 같은 category_code는 반드시 같은 파티션에 모이므로 폴더당 파일이 정확히 1개로 줄어듦. 추가로 AQE(Adaptive Query Execution)가 실제 데이터 크기(263MiB)를 보고 기본 200개 셔플 파티션을 자동으로 10개까지 줄여줘서 연산 단계 자체도 빨라짐.
+
+| | repartition 전 | repartition 후 |
+|---|---|---|
+| 전체 소요 시간 | ~20분 (커밋만 14분) | 4분 42초 |
+| 오브젝트 개수 | 3014개 | 130개 |
+| 폴더당 파일 개수 | 최대 24개 | 정확히 1개 |
+
+```python
+refined_df.repartition('category_code').write.mode('Overwrite').partitionBy('category_code').parquet("s3a://test-bucket/silver/ecommerce_refined")
+```
+
+**주의**: `repartition(col)`은 셔플이 발생함(비용 있음). 반면 `coalesce(N)`은 셔플 없이 이웃 파티션을 억지로 합치는 방식이라 싸지만 "같은 값끼리 모아준다"는 보장이 없음. 골드 레이어처럼 이미 작은 집계 결과(수십~수백 행)를 쓸 때는 `.coalesce(1)`이면 충분 (셔플 비용 없이 파일 1개로 정리됨), `partitionBy`로 대용량을 쓸 때는 `repartition(파티션컬럼)`이 정석.
+
+---
+
+## 12. 파티션/셔플 개념 정리 (참고용)
+
+- **셔플이란**: 여러 executor(파티션)에 흩어진 데이터를, 특정 연산(dropDuplicates/groupBy/non-broadcast join/repartition/orderBy)을 위해 키 기준으로 다시 네트워크로 재배치하는 것. `explain(True)`의 physical plan에서 `Exchange hashpartitioning(...)`으로 확인 가능. `local[*]`에서도 실제로 로컬 디스크(`/tmp/spark-*`, `/tmp/blockmgr-*`)에 임시 파일을 쓰고 읽는 방식으로 똑같이 발생함(네트워크 대신 로컬 I/O일 뿐).
+- **`BroadcastExchange`는 셔플이 아님**: 작은 테이블을 통째로 모든 executor에 복사하는 것이라, 큰 쪽 데이터는 이동하지 않음. `sf.broadcast()`로 명시적으로 유도 가능하고, join에서 셔플을 피하는 핵심 수단.
+- **셔플 임시 데이터 저장 위치**: MinIO(S3)가 아니라 각 executor의 **로컬 디스크**. `local[*]`에서는 컨테이너 자체의 `/tmp`, 클러스터 모드에서는 각 executor 팟의 로컬 스토리지(emptyDir 등)에 저장됐다가, job이 끝나거나 팟이 죽으면 같이 사라짐. k3s에는 YARN의 External Shuffle Service가 없어서, idle executor가 회수되면 그 executor가 들고 있던 셔플 데이터가 통째로 날아감 — `spark.dynamicAllocation.shuffleTracking.enabled=true`를 켜는 이유.
+- **파티션(실행) vs `partitionBy`(저장) 개념 구분**:
+  - Spark 실행 파티션: 메모리상에서 병렬 처리 단위로 데이터를 나눈 조각. `df.rdd.getNumPartitions()`.
+  - `.write().partitionBy(col)`: 저장 시 컬럼 값별로 폴더를 나누는 것(Hive 스타일). **폴더 개수 = 그 컬럼의 고유값 개수**, 셔플/실행 파티션 개수와 무관.
+  - **폴더 안 파일 개수 = 쓰는 시점의 Spark 실행 파티션 개수**. 예: 실행 파티션이 4개면, 어떤 값을 가진 폴더든 최대 4개 파일이 생길 수 있음(그 값이 여러 파티션에 흩어져 있었다면). 이게 실무에서 "small file 문제"의 근본 원인이고, `repartition(파티션컬럼)`으로 해결.
+
+---
+
+## 13. Docker Desktop 재시작 후 클러스터 복구 절차 (반복 발생 이슈)
+
+Docker Desktop이 재시작/크래시되면 `k8s-master-node`(k3s) 컨테이너가 통째로 재생성되면서 **k3s 내부 상태가 전부 초기화**됨 (RBAC, ServiceAccount, History Server Deployment, `spark-live-driver-ui` Service 등). 반면 MinIO 데이터는 볼륨 마운트(`02/minio_data/`)라 생존함.
+
+**증상 확인**:
+```bash
+docker ps   # 컨테이너 AGE가 최근이면 재생성 의심
+docker exec k8s-master-node kubectl get pods -A   # kube-system 기본 팟만 있고 spark 관련 팟/서비스 없으면 확정
+```
+
+**복구 순서** (8-1, 7-2-5, 9 절차를 다시):
+```bash
+# 1. RBAC
+docker exec k8s-master-node kubectl create serviceaccount spark --namespace=default
+docker exec k8s-master-node kubectl create rolebinding spark-role --clusterrole=edit --serviceaccount=default:spark --namespace=default
+
+# 2. spark-events 디렉토리 마커
+# (mc cp 아무 파일이나 spark-events/.keep 으로)
+
+# 3. History Server + live-driver-ui Service 배포 (8-1, 9의 yaml 그대로 kubectl apply)
+
+# 4. kubeconfig 재복사 (컨테이너 IP/인증서가 바뀌었을 수 있음)
+docker cp k8s-master-node:/etc/rancher/k3s/k3s.yaml ~/.kube_pysprak02/k3s.yaml
+# server: https://127.0.0.1:6443 → https://localhost:6443 로 치환
+
+# 5. 포트포워딩 재연결 (18080, 4040 watch loop)
+```
+
+**주의 — 중복 프로세스 문제**: Windows 환경에서 `nohup ... &`로 백그라운드에 띄운 프로세스가 "죽은 줄 알았는데 실제로는 안 죽고 orphan으로 계속 살아있는" 경우가 있었음. 나중에 다시 `watch-4040.sh`를 새로 띄웠더니 옛날 프로세스와 새 프로세스가 동시에 포트 4040을 잡으려고 경합해서 `Only one usage of each socket address...` 에러가 로그에 계속 쌓임(둘 중 하나는 항상 실패). 확인/정리 방법:
+```powershell
+Get-NetTCPConnection -LocalPort 4040 | Select-Object OwningProcess
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match "watch-4040" } | Select-Object ProcessId, ParentProcessId, CommandLine
+# 실제로 포트를 물고 있는(Listen) PID 말고, 나머지 오래된 트리를 Stop-Process로 정리
+```
+→ 포트포워딩을 다시 걸기 전에는 항상 기존 프로세스가 남아있는지 먼저 확인할 것.
+
+---
+
+## 14. Gold 레이어(통계) 파이프라인 (`03.py`)
+
+Silver(`ecommerce_refined`)를 읽어서 집계 결과를 `s3a://test-bucket/gold/*`에 저장하는 스크립트. 이벤트 퍼널, 카테고리/브랜드별 매출, 일별 추이, 가격 기술통계 8개 테이블 생성.
+
+```python
+funnel_df = df.groupBy('event_type').count()
+funnel_df.coalesce(1).write.mode('overwrite').parquet("s3a://test-bucket/gold/event_funnel")
+# ... (category_revenue, brand_revenue, daily_events, daily_purchase, price_stats, price_percentiles, purchase_price_stats 동일 패턴)
+```
+
+각 결과가 이미 작은 집계 테이블이라 `.coalesce(1)`로 파일 1개씩만 나오게 정리(셔플 없는 방식이라 저비용). 실행 시간 2분 34초로 완료(silver 263MiB만 읽으면 되므로 가벼움).
+
+**결과 확인은 `resultView.ipynb`에서** — `01View.ipynb`와 같은 패턴(`local[*]` 세션)으로 gold 테이블들만 읽어서 `.show()`. Gold는 이미 계산 끝난 작은 결과라 로컬로 읽어도 느리지 않음(무거운 연산은 클러스터에서 이미 끝났고, 노트북은 결과 소비만 담당).
+
+---
+
+## 15. Bronze → Silver → Gold 파이프라인 연결 방식 (실무 참고)
+
+- **02(silver) + 03(gold)를 하나의 스크립트/제출로 합치는 것은 실무에서 잘 안 씀**: gold 로직만 고쳐도 무거운 silver부터 매번 재실행해야 하고, 중간 실패 시 전부 재시작해야 하고, 같은 silver를 여러 gold job이 재사용하는 구조를 못 만듦.
+- **실무 표준은 각 레이어를 독립 job으로 두고 오케스트레이터로 순서/의존성만 관리**: Airflow(`KubernetesPodOperator`), Argo Workflows(k8s 네이티브), Databricks Workflows 등. `_SUCCESS` 마커 파일(우리가 매번 확인한 것)이 바로 "이전 단계가 끝났다"를 판단하는 신호로 쓰임.
+- **지금 이 프로젝트(오케스트레이터 없음) 현재 방식**: `02.py` 제출 → MinIO에서 `_SUCCESS` 확인 → 그 다음 `03.py` 제출, 손으로 순서 관리. Airflow 학습 예정이라, 이 수동 순서가 그대로 `silver_task >> gold_task` DAG로 옮겨갈 예정.
