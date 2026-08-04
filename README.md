@@ -10,8 +10,9 @@ PySpark 학습용 실습 저장소. Docker 기반 Jupyter + Spark 환경에서 R
 | [`01/`](01) | 멀티 노드 클러스터 | Jupyter(마스터) + Spark 워커 2대로 구성된 클러스터. 실제 클러스터 연결·분산 처리 실습 |
 | [`02/`](02) | Kubernetes(k3s) 클러스터 모드 | k3s + MinIO(S3 호환) + Jupyter. `spark-submit --deploy-mode cluster`로 k8s 팟을 동적 생성해 처리하는 실무형 파이프라인(Bronze/Silver/Gold) 실습 |
 | [`03/`](03) | 오케스트레이션(Airflow) | `02`의 k3s/MinIO를 그대로 재사용하면서, Airflow `KubernetesPodOperator`로 ingest→Bronze→Silver→Gold 전체를 DAG(`medallion_pipeline`)로 자동화 |
+| [`04/`](04) | 쿼리 엔진 + BI(Trino/Superset) | `02`의 MinIO를 그대로 재사용해, Hive Metastore(카탈로그) + Trino(SQL 쿼리 엔진) + Superset(BI 대시보드)로 Gold 레이어를 실무형으로 조회·시각화 |
 
-`00`, `01`은 동일한 구조(`docker-compose.yml`, `requirements.txt`, `실습코드/`)를 가지며, 각자 독립적으로 `docker compose up`으로 띄울 수 있습니다. `02`는 별도로 MinIO와 k3s가 추가된 구조이고, `03`은 `02`의 네트워크/볼륨을 참조해 Airflow만 추가로 얹은 구조입니다(아래 참고).
+`00`, `01`은 동일한 구조(`docker-compose.yml`, `requirements.txt`, `실습코드/`)를 가지며, 각자 독립적으로 `docker compose up`으로 띄울 수 있습니다. `02`는 별도로 MinIO와 k3s가 추가된 구조이고, `03`/`04`는 각각 `02`의 네트워크/볼륨을 참조해 Airflow, Trino+Superset을 추가로 얹은 구조입니다(아래 참고).
 
 ### 00 — 싱글 노드 (`00/docker-compose.yml`)
 
@@ -99,6 +100,36 @@ docker compose up -d
 | [`03/명령어.md`](03/명령어.md) | `docker compose`, Airflow CLI, k3s 팟 확인, code-bucket 업로드 명령 정리 |
 | [`03/시행착오_0803-0804.md`](03/시행착오_0803-0804.md) | Airflow 도입 시행착오(kubeconfig 변환, provider 미설치, `--unzip` 조용한 실패, MinIO IP 불일치로 인한 job 무한 대기 등) |
 
+### 04 — 쿼리 엔진 + BI (`04/docker-compose.yml`)
+
+Gold 레이어(parquet)는 그 자체로 SQL 조회가 안 되기 때문에, `02`가 만든 MinIO를 그대로 두고 그 위에 **Hive Metastore(카탈로그) → Trino(쿼리 엔진) → Superset(BI)** 3단 구조를 얹어 실무형으로 조회·시각화하는 구성. `03`과 마찬가지로 `02`가 먼저 떠 있어야 하며, `03`과는 독립적으로(동시에 떠 있어도 무방) 실행 가능.
+
+- 컨테이너 4개
+  - `hive-metastore-jars-init` (1회성): Hive Metastore가 S3A(MinIO)에 접속하는 데 필요한 `hadoop-aws`/AWS SDK v2 `bundle` jar를 미리 받아둠 (이미지 내장 Hadoop 버전인 3.4.1과 정확히 맞는 버전)
+  - `hive-metastore` (`apache/hive:4.1.0`): Gold parquet 경로/스키마 메타데이터를 저장하는 카탈로그. 내장 Derby DB 사용(학습 규모)
+  - `trino` (`trinodb/trino`): Hive Metastore에 스키마를 물어보고 MinIO에서 직접 데이터를 읽어 SQL을 실행하는 MPP 쿼리 엔진. 카탈로그 이름 `minio_lake`, coordinator 혼자 worker 역할까지 겸함
+  - `superset` (`apache/superset`): Trino를 데이터소스로 연결한 BI 대시보드. `admin`/`admin` 계정, Trino 연결이 REST API로 미리 등록되어 있어 로그인만 하면 바로 SQL Lab 사용 가능
+- 포트: `8091`(Trino 웹 UI), `9083`(Hive Metastore thrift), `8889 → 8088`(Superset 웹 UI)
+
+```bash
+cd 04
+docker compose up -d
+docker cp register_gold_tables.sql trino:/tmp/register_gold_tables.sql   # 최초 1회
+docker exec trino trino -f /tmp/register_gold_tables.sql                 # Gold 8개 테이블을 minio_lake.gold 스키마에 등록
+# http://localhost:8091 : Trino 웹 UI
+# http://localhost:8889 : Superset (admin/admin)
+```
+
+등록된 테이블은 외부 테이블(external table)이라 메타데이터만 위치를 가리킬 뿐 데이터 사본을 안 가짐 — Gold가 파이프라인 재실행으로 갱신돼도 스키마만 안 바뀌면 재등록 없이 다음 쿼리부터 바로 최신 데이터가 보임.
+
+| 문서 | 내용 |
+| --- | --- |
+| [`04/이론.md`](04/이론.md) | Schema-on-Read/외부 테이블/Hive Metastore/MPP 쿼리 엔진 이론 + 데이터 관계 유형(비교/추세/구성/분포/관계)별 차트 선택 기준, 흔한 시각화 실수 |
+| [`04/구성요소와_대시보드_만들기.md`](04/구성요소와_대시보드_만들기.md) | MinIO→Hive Metastore→Trino→Superset 각 컴포넌트 역할, Superset의 Database→Dataset→Chart→Dashboard 흐름, Gold 테이블 8종별 추천 차트 |
+| [`04/함수.md`](04/함수.md) | Trino DDL/DQL 문법(`CREATE SCHEMA`/`CREATE TABLE ... external_location`), Trino CLI, Superset REST API 정리 |
+| [`04/명령어.md`](04/명령어.md) | `docker compose`, Trino/Hive Metastore 내부 디버깅, Superset 컨테이너 디버깅, Windows Git Bash `MSYS_NO_PATHCONV` 이슈 정리 |
+| [`04/시행착오.md`](04/시행착오.md) | Trino 리전 누락으로 인한 재시작 루프, Hadoop 3.4.1/AWS SDK v2 버전 불일치, `HIVE_CUSTOM_CONF_DIR`가 `find` 부재로 조용히 실패한 문제, Superset의 `sqlalchemy-trino` 설치가 SQLAlchemy 2.x를 끌고 와 Superset을 깨뜨린 문제 |
+
 ## 공통 의존성 (`requirements.txt`)
 
 컨테이너 기동 시 자동 설치됩니다 (numpy ABI 충돌 방지를 위해 핵심 수치 스택은 버전 고정).
@@ -154,6 +185,18 @@ docker compose up -d
 | `upload_to_bucket.py` (03 루트) | `02/실습코드/01/*.py` + `ingest/ingest.py`를 `code-bucket`에 재업로드하는 스크립트. 로컬 코드를 고친 뒤 반드시 실행해야 실제 실행 대상에 반영됨 |
 
 파이프라인 전체의 시행착오 히스토리(Airflow 도입기, kubeconfig 변환, MinIO IP 불일치로 인한 job 무한 대기 디버깅 등)는 **[`03/시행착오_0803-0804.md`](03/시행착오_0803-0804.md)** 에 기록되어 있습니다.
+
+### `04/` — Trino + Hive Metastore + Superset 구성 파일
+
+| 파일 | 역할 |
+| --- | --- |
+| `docker-compose.yml` | 4개 컨테이너(jars-init/hive-metastore/trino/superset) 정의, `02`의 네트워크를 `external: true`로 재사용 |
+| `trino/etc/` | Trino 노드/JVM/coordinator 설정 + `catalog/minio_lake.properties`(Hive 커넥터, MinIO S3 접속 정보, 리전) |
+| `metastore-conf/core-site.xml` | Hive Metastore가 S3A(MinIO)에 접속하기 위한 Hadoop 설정(엔드포인트/자격증명/path-style access) — `/opt/hive/conf/`에 직접 마운트 |
+| `superset_config.py` / `superset-bootstrap.sh` | Superset의 `SECRET_KEY` 설정과, 컨테이너 기동 시 DB 마이그레이션·관리자 계정 생성·Trino 드라이버(`trino` 패키지) 설치를 수행하는 부트스트랩 스크립트 |
+| `register_gold_tables.sql` | Gold parquet 8개 폴더를 `minio_lake.gold` 스키마의 외부 테이블로 등록하는 DDL. Gold의 컬럼 구성이 바뀌면 이 파일도 같이 고쳐서 재실행 |
+
+파이프라인 전체의 시행착오 히스토리(Trino 리전 누락, Hadoop/AWS SDK 버전 불일치, `HIVE_CUSTOM_CONF_DIR` 무동작, Superset 의존성 충돌 등)는 **[`04/시행착오.md`](04/시행착오.md)** 에 기록되어 있습니다.
 
 ## 요구 사항
 
