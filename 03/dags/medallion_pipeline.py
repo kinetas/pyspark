@@ -25,7 +25,7 @@ SPARK_IMAGE = "apache/spark:3.4.1"
 
 # MinIO 컨테이너(k8s-s3-minio) IP. 02/명령어.md 참고 — 컨테이너 재생성 시 바뀔 수 있으므로
 # `docker inspect k8s-s3-minio --format '{{json .NetworkSettings.Networks}}'`로 재확인 후 여기만 고치면 됨.
-S3A_ENDPOINT = "http://172.19.0.3:9000"
+S3A_ENDPOINT = "http://172.19.0.4:9000"
 
 # 자격증명은 DAG 코드/이미지에 안 넣고 K8s Secret에서만 가져온다 (kubectl create secret으로 미리 생성해둠).
 KAGGLE_SECRETS = [

@@ -7,7 +7,7 @@ import pyspark.sql.functions as sf
 spark = SparkSession.builder.appName("K8sStatsJob").getOrCreate()
 
 hadoop_conf = spark._jsc.hadoopConfiguration()
-hadoop_conf.set("fs.s3a.endpoint", "http://172.19.0.3:9000")
+hadoop_conf.set("fs.s3a.endpoint", "http://172.19.0.4:9000")
 hadoop_conf.set("fs.s3a.access.key","minioadmin")
 hadoop_conf.set("fs.s3a.secret.key","minioadmin")
 hadoop_conf.set("fs.s3a.path.style.access","true")
